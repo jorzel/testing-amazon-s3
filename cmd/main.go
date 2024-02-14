@@ -3,112 +3,102 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	"amazon-s3-uploader/internal"
 
-	"github.com/aws/aws-sdk-go/aws"
-	awsCred "github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/minio/minio-go"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/spf13/cobra"
 )
 
+type UploadSpec struct {
+	accessKey  string
+	secretKey  string
+	bucketName string
+	fileName   string
+}
+
 func main() {
-	accessKey := "key"
-	secretKey := "secret"
-	region := "eu-central-1"
-	bucketName := "jorzelbucket"
+	rootCmd := newRootCmd()
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func newRootCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use: "uploader",
+	}
+
+	cmd.AddCommand(
+		uploadCmd(),
+	)
+	return cmd
+}
+
+func uploadCmd() *cobra.Command {
+	var fileName string
+	var bucketName string
+	var accessKey string
+	var secretKey string
+	cmd := &cobra.Command{
+		Use:   "upload",
+		Short: "upload file to s3 bucket",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fileName, err := cmd.Flags().GetString("filename")
+			if err != nil {
+				return err
+			}
+			bucketName, err := cmd.Flags().GetString("bucket")
+			if err != nil {
+				return err
+			}
+			accessKey, err := cmd.Flags().GetString("accesskey")
+			if err != nil {
+				return err
+			}
+			secretKey, err := cmd.Flags().GetString("secretkey")
+			if err != nil {
+				return err
+			}
+			return upload(UploadSpec{
+				fileName:   fileName,
+				bucketName: bucketName,
+				accessKey:  accessKey,
+				secretKey:  secretKey,
+			})
+		},
+	}
+	cmd.PersistentFlags().StringVarP(&fileName, "filename", "f", "", "Full file path to resource")
+	cmd.MarkPersistentFlagRequired("filename")
+	cmd.PersistentFlags().StringVarP(&accessKey, "accesskey", "a", "", "Amazon S3 Access Key")
+	cmd.MarkPersistentFlagRequired("accesskey")
+	cmd.PersistentFlags().StringVarP(&secretKey, "secretkey", "x", "", "Amazon S3 Secret Key")
+	cmd.MarkPersistentFlagRequired("secretkey")
+	cmd.PersistentFlags().StringVarP(&bucketName, "bucket", "b", "", "Amazon S3 Bucket Name")
+	cmd.MarkPersistentFlagRequired("bucket")
+	return cmd
+}
+
+func upload(spec UploadSpec) error {
+	endpoint := "s3.amazonaws.com"
 
 	// Initialize AWS session for S3Uploader
-	sess, err := session.NewSession(&aws.Config{
-		Region:      aws.String(region),
-		Credentials: awsCred.NewStaticCredentials(accessKey, secretKey, ""),
-	})
-	if err != nil {
-		log.Fatalf("failed to initialize AWS session: %v", err)
-	}
-	svc := s3.New(sess)
-	s3Uploader := &internal.S3Uploader{Service: svc}
-
-	service := internal.UploadService{
-		Uploader: s3Uploader,
-	}
-	service.Upload(context.Background(), "./")
-	// Upload file using S3Uploader
-	// err = s3Uploader.UploadFile(bucketName, "example.md", "./README.md")
-	// if err != nil {
-	// 	log.Fatalf("failed to upload file to S3: %v", err)
-	// }
-	//https://minioserver.example.net
-	// Initialize MinIO client for MinIOUploader
-
-	ctx := context.Background()
-	req := testcontainers.ContainerRequest{
-		Env: map[string]string{
-			"MINIO_ACCESS_KEY": accessKey,
-			"MINIO_SECRET_KEY": secretKey,
-		},
-		Image: "minio/minio",
-
-		ExposedPorts: []string{"9000/tcp"},
-		WaitingFor:   wait.ForHTTP("/minio/health/live").WithPort("9000"),
-		Cmd:          []string{"server", "/data"},
-	}
-	minioContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
-	if err != nil {
-		panic(err)
-	}
-	defer minioContainer.Terminate(ctx)
-
-	// minioContainer, err := testMinio.RunContainer(ctx, testcontainers.WithImage("minio/minio"))
-	// if err != nil {
-	// 	log.Fatalf("failed to start container: %s", err)
-	// }
-
-	// // Clean up the container
-	// defer func() {
-	// 	if err := minioContainer.Terminate(ctx); err != nil {
-	// 		log.Fatalf("failed to terminate container: %s", err)
-	// 	}
-	// }()
-
-	// Get MinIO container IP and port
-	endpoint, err := minioContainer.Endpoint(ctx, "")
-	if err != nil {
-		panic(err)
-	}
-
-	// Initialize MinIO client
-	minioClient, err := minio.New(
+	s3Client, err := minio.New(
 		endpoint,
-		accessKey,
-		secretKey,
-		false, // Change to true if MinIO is configured with TLS
+		&minio.Options{Secure: true, Creds: credentials.NewStaticV4(spec.accessKey, spec.secretKey, "")},
 	)
 	if err != nil {
-		panic(err)
+		return err
+	}
+	s3Uploader := &internal.MinIOUploader{Client: s3Client}
+
+	err = s3Uploader.UploadFile(context.Background(), spec.bucketName, spec.fileName)
+	if err != nil {
+		return err
 	}
 
-	// Create a bucket for testing
-	err = minioClient.MakeBucket(bucketName, region)
-	if err != nil {
-		panic(err)
-	}
-
-	if err != nil {
-		log.Fatalf("failed to initialize MinIO client: %v", err)
-	}
-	minioUploader := &internal.MinIOUploader{Client: minioClient}
-
-	// Upload file using MinIOUploader
-	err = minioUploader.UploadFile(ctx, bucketName, "example.md", "./README.md")
-	if err != nil {
-		log.Fatalf("failed to upload file to MinIO: %v", err)
-	}
-	log.Println("Upload success")
+	log.Printf("Upload of: %s to bucket: %s success", spec.fileName, spec.bucketName)
+	return nil
 }
